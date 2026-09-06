@@ -54,6 +54,8 @@ type healthModels struct {
 	Go                int        `json:"go"`
 	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
 	StaleAfterSeconds int        `json:"stale_after_seconds"`
+	CacheSource       string     `json:"cache_source,omitempty"`
+	Stale             bool       `json:"stale"`
 }
 
 type healthKeys struct {
@@ -83,6 +85,8 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
+	catalog := newModelCatalog(cfg.Prefer, cfg.Models.Protocols)
+	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	return &Gateway{
 		cfg:        cfg,
 		logger:     logger,
@@ -90,7 +94,7 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
 		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
-		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
+		catalog:    catalog,
 		monitor:    monitor,
 	}, nil
 }
@@ -123,7 +127,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		if models.Exposed == 0 {
 			modelStatus = "empty"
 			issues = append(issues, "model_catalog_empty")
-		} else if time.Since(models.UpdatedAt) > staleAfter {
+		} else if models.Stale || time.Since(models.UpdatedAt) > staleAfter {
 			modelStatus = "stale"
 			issues = append(issues, "model_catalog_stale")
 		}
@@ -136,9 +140,13 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	status := "ok"
-	httpStatus := http.StatusOK
 	if len(issues) > 0 {
 		status = "degraded"
+	}
+	blocking := modelStatus == "pending" || modelStatus == "empty" || proxyHealthy == 0
+	httpStatus := http.StatusOK
+	ready := !blocking
+	if blocking {
 		httpStatus = http.StatusServiceUnavailable
 		if modelStatus == "pending" {
 			status = "starting"
@@ -146,7 +154,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, httpStatus, healthResponse{
 		Status:  status,
-		Ready:   len(issues) == 0,
+		Ready:   ready,
 		Version: version,
 		Models: healthModels{
 			Status:            modelStatus,
@@ -156,6 +164,8 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Go:                models.Go,
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
+			CacheSource:       models.CacheSource,
+			Stale:             models.Stale,
 		},
 		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
 		Proxies: healthProxies{
@@ -201,10 +211,40 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		if g.cfg.Anonymous && len(g.cfg.ZenKeys) == 0 && len(g.cfg.GoKeys) == 0 && !g.catalog.anonymousDecision(model).Allowed {
 			continue
 		}
-		if _, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous); err != nil {
+		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+		if err != nil {
 			continue
 		}
-		data = append(data, map[string]any{"id": model, "object": "model", "created": now, "owned_by": "opencode"})
+		// Tier-scoped metadata: the advertised context window must match
+		// the tier that will serve the request (anonymous ⇒ Zen).
+		md := g.catalog.MetadataForTier(model, route.Tier)
+		entry := map[string]any{
+			"id": model, "object": "model", "created": now, "owned_by": "opencode",
+			"metadata": md,
+		}
+		// Top-level OpenAI-standard fields: discovery clients (jcode, Pi, …)
+		// read context/reasoning at the top level of each model entry.
+		if md.ContextWindow > 0 {
+			entry["context_window"] = md.ContextWindow
+			entry["context_length"] = md.ContextWindow
+		}
+		if md.MaxInput > 0 {
+			entry["max_input"] = md.MaxInput
+		}
+		if md.MaxOutput > 0 {
+			entry["max_output"] = md.MaxOutput
+		}
+		if md.Reasoning {
+			entry["reasoning"] = true
+			entry["supports_reasoning"] = true
+		}
+		if md.ToolCall {
+			entry["tool_call"] = true
+		}
+		if md.StructuredOutput {
+			entry["structured_output"] = true
+		}
+		data = append(data, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
@@ -289,12 +329,9 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			var usage bridgeUsage
 			var usageReported bool
 			if external == upstreamRoute.Protocol {
-				observer := newStreamUsageObserver(upstreamRoute.Protocol)
-				_, err = io.Copy(w, io.TeeReader(resp.Body, observer))
-				usage = observer.Finish()
-				usageReported = observer.Reported()
+				usage, usageReported, err = forwardSSEWithUsageContext(r.Context(), w, resp.Body, upstreamRoute.Protocol, model)
 			} else {
-				usage, usageReported, err = transcodeStreamWithUsage(w, resp.Body, upstreamRoute.Protocol, external, model)
+				usage, usageReported, err = transcodeStreamWithUsageContext(r.Context(), w, resp.Body, upstreamRoute.Protocol, external, model)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
@@ -371,15 +408,132 @@ func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs) (*http.Response, modelRoute, error) {
+	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
+		return resp, effectiveRoute, err
+	}
+	origBody := resp.Body
+	errBody, readErr := io.ReadAll(io.LimitReader(origBody, 1<<20))
+	// The original network body is always closed here: the retry path below
+	// reuses the connection, otherwise downstream receives a fresh in-memory
+	// reader over the cached bytes.
+	drainAndClose(origBody)
+	if readErr != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(errBody))
+		return resp, effectiveRoute, nil
+	}
+	// Restore the body so downstream error handling still sees the original
+	// payload when no retry happens below.
+	resp.Body = io.NopCloser(bytes.NewReader(errBody))
+	if !isStaleReasoningReference(errBody) {
+		return resp, effectiveRoute, nil
+	}
+	stripped, changed := stripStaleReasoningInputs(effectiveRoute, bodies)
+	if !changed {
+		return resp, effectiveRoute, nil
+	}
+	// The referenced reasoning items belong to an upstream chain this session
+	// can no longer address (e.g. an interrupted stream). Replay once without
+	// them under a fresh upstream session instead of failing the client
+	// request outright. Attempt numbering continues from the first round so
+	// monitoring never shows duplicate attempt numbers for one request.
+	retryIDs := ids
+	retryIDs.Session = randomID("ses", 12)
+	g.logger.Info("retrying upstream without stale reasoning references", "component", "upstream", "event", "reasoning_reference_retry", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
+	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, retryIDs, attempts)
+	if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
+		retryStatus := 0
+		if retryResp != nil {
+			retryStatus = retryResp.StatusCode
+			drainAndClose(retryResp.Body)
+		}
+		g.logger.Warn("reasoning reference retry failed; returning original error", "component", "upstream", "event", "reasoning_reference_retry_failed", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "error", retryErr, "retry_status", retryStatus)
+		fallback := *resp
+		fallback.Body = io.NopCloser(bytes.NewReader(errBody))
+		return &fallback, effectiveRoute, nil
+	}
+	return retryResp, retryRoute, nil
+}
+
+// isStaleReasoningReference reports whether an upstream 400 body describes a
+// reasoning item/reference the server no longer recognizes, such as
+// "Referenced reasoning item 'rs_...' was not found or has expired".
+// Generic validation errors that merely mention reasoning (e.g. "unknown
+// reasoning field") must NOT match, so both the target phrase and the
+// gone/expired marker are required.
+func isStaleReasoningReference(body []byte) bool {
+	text := strings.ToLower(string(body))
+	if !strings.Contains(text, "reasoning item") && !strings.Contains(text, "reasoning reference") {
+		return false
+	}
+	for _, marker := range []string{"not found", "expir", "does not exist", "no longer"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripStaleReasoningInputs removes server-issued reasoning references from
+// Responses-protocol upstream payloads: replayed "reasoning" input items and
+// any previous_response_id chain link. Other tiers/protocols are passed
+// through untouched. It reports whether any payload actually changed.
+func stripStaleReasoningInputs(route modelRoute, bodies map[Tier][]byte) (map[Tier][]byte, bool) {
+	changed := false
+	out := make(map[Tier][]byte, len(bodies))
+	for tier, body := range bodies {
+		if len(body) == 0 || route.ProtocolFor(tier) != ProtocolResponses {
+			out[tier] = body
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			out[tier] = body
+			continue
+		}
+		tierChanged := false
+		if _, ok := payload["previous_response_id"]; ok {
+			delete(payload, "previous_response_id")
+			tierChanged = true
+		}
+		if raw, ok := payload["input"].([]any); ok {
+			kept := make([]any, 0, len(raw))
+			for _, item := range raw {
+				if m, ok := item.(map[string]any); ok && stringAt(m, "type") == "reasoning" {
+					tierChanged = true
+					continue
+				}
+				kept = append(kept, item)
+			}
+			if tierChanged {
+				payload["input"] = kept
+			}
+		}
+		if !tierChanged {
+			out[tier] = body
+			continue
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			out[tier] = body
+			continue
+		}
+		out[tier] = encoded
+		changed = true
+	}
+	return out, changed
+}
+
+func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, modelRoute, int, error) {
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
-	attempts := 0
+	attempts := attemptOffset
 	if route.Anonymous {
-		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids)
+		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
-			return resp, route, nil
+			return resp, route, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
 		if len(route.KeyTiers) > 0 {
@@ -404,24 +558,24 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, bodies map[T
 		resp, err, used := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
-			return resp, keyRoute, nil
+			return resp, keyRoute, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
 	}
 	if lastResponse != nil {
-		return lastResponse, effectiveRoute, nil
+		return lastResponse, effectiveRoute, attempts, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no usable upstream route")
 	}
-	return nil, effectiveRoute, lastErr
+	return nil, effectiveRoute, attempts, lastErr
 }
 
 // doAnonymousUpstream tries every currently available proxy at most once. Any
 // failure, including an HTTP error response, advances to the next proxy. Only a
 // successful response ends the anonymous phase; exhausting the proxy cursor
 // returns control to the preferred authenticated tiers.
-func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs) (*http.Response, error, int) {
+func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
@@ -438,7 +592,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		attempts++
 		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
-			meta.Attempts = attempts
+			meta.Attempts = attemptOffset + attempts
 			meta.Tier = string(TierZen)
 		}
 		if lastResponse != nil {
@@ -458,7 +612,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			status = resp.StatusCode
 		}
 		g.syncProxyResult(ctx, node.proxy, status, err)
-		g.recordUpstreamAttempt(route, ids, attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
+		g.recordUpstreamAttempt(route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.anonymous.MarkSuccess(node)
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
@@ -813,11 +967,19 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 			capabilities, capabilitiesErr = g.refreshProtocolCapabilities(capabilityCtx)
 		}()
 		wg.Wait()
+		if ctx.Err() != nil {
+			return
+		}
 		if capabilitiesErr != nil {
 			g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "error", capabilitiesErr)
 		}
 		if zen != nil || goModels != nil {
-			g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported)
+			g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+			if ctx.Err() == nil {
+				if err := g.catalog.SaveCache(); err != nil {
+					g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "error", err)
+				}
+			}
 			g.logger.Info("model catalog refreshed", "component", "models", "event", "catalog_refreshed", "models", len(g.catalog.List()))
 		}
 	}

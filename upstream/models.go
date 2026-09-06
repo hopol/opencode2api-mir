@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -85,17 +88,38 @@ type modelCatalog struct {
 	// catalog. protocols remains the user-configured override map.
 	nativeProtocols map[Tier]map[string]Protocol
 	unsupported     map[Tier]map[string]bool
+	modelMeta       map[Tier]map[string]ModelMetadata
 	updatedAt       time.Time
 	prefer          Tier
 	metadata        *modelMetadataStore
+	cachePath       string
+	cacheSource     string
+	stale           bool
+	refreshAfter    time.Duration
 }
 
 type modelCatalogSnapshot struct {
-	Zen       int       `json:"zen"`
-	Go        int       `json:"go"`
-	Total     int       `json:"total"`
-	Exposed   int       `json:"exposed"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	Zen         int       `json:"zen"`
+	Go          int       `json:"go"`
+	Total       int       `json:"total"`
+	Exposed     int       `json:"exposed"`
+	UpdatedAt   time.Time `json:"updated_at,omitempty"`
+	CacheSource string    `json:"cache_source,omitempty"`
+	Stale       bool      `json:"stale"`
+}
+
+const modelCatalogCacheSchemaVersion = 3
+
+var modelCatalogCacheWriteMu sync.Mutex
+
+type modelCatalogCache struct {
+	SchemaVersion   int                               `json:"schema_version"`
+	UpdatedAt       time.Time                         `json:"updated_at"`
+	Zen             []string                          `json:"zen"`
+	Go              []string                          `json:"go"`
+	NativeProtocols map[Tier]map[string]Protocol      `json:"native_protocols"`
+	Unsupported     map[Tier]map[string]bool          `json:"unsupported"`
+	Metadata        map[Tier]map[string]ModelMetadata `json:"metadata,omitempty"`
 }
 
 func newModelCatalog(prefer Tier, overrides map[string]string) *modelCatalog {
@@ -107,14 +131,27 @@ func newModelCatalog(prefer Tier, overrides map[string]string) *modelCatalog {
 		zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols,
 		nativeProtocols: map[Tier]map[string]Protocol{TierZen: {}, TierGo: {}},
 		unsupported:     map[Tier]map[string]bool{TierZen: {}, TierGo: {}}, prefer: prefer,
+		cacheSource: "none",
 	}
 }
 
-func (c *modelCatalog) Replace(zen, goModels []string) {
-	c.ReplaceWithCapabilities(zen, goModels, nil, nil)
+func (c *modelCatalog) SetCachePath(path string) {
+	c.mu.Lock()
+	c.cachePath = path
+	c.mu.Unlock()
 }
 
-func (c *modelCatalog) ReplaceWithCapabilities(zen, goModels []string, native map[Tier]map[string]Protocol, unsupported map[Tier]map[string]bool) {
+func (c *modelCatalog) SetRefreshInterval(interval time.Duration) {
+	c.mu.Lock()
+	c.refreshAfter = interval
+	c.mu.Unlock()
+}
+
+func (c *modelCatalog) Replace(zen, goModels []string) {
+	c.ReplaceWithCapabilities(zen, goModels, nil, nil, nil)
+}
+
+func (c *modelCatalog) ReplaceWithCapabilities(zen, goModels []string, native map[Tier]map[string]Protocol, unsupported map[Tier]map[string]bool, metadata map[Tier]map[string]ModelMetadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if zen != nil {
@@ -137,7 +174,12 @@ func (c *modelCatalog) ReplaceWithCapabilities(zen, goModels []string, native ma
 			}
 		}
 	}
-	c.updatedAt = time.Now()
+	if metadata != nil {
+		c.modelMeta = cloneModelMeta(metadata)
+	}
+	c.updatedAt = time.Now().UTC()
+	c.cacheSource = "live"
+	c.stale = false
 }
 
 func (c *modelCatalog) CopyState(source *modelCatalog) {
@@ -163,11 +205,62 @@ func (c *modelCatalog) CopyState(source *modelCatalog) {
 			unsupported[tier][model] = value
 		}
 	}
+	meta := cloneModelMeta(source.modelMeta)
 	updatedAt := source.updatedAt
+	cacheSource := source.cacheSource
+	stale := source.stale
 	source.mu.RUnlock()
 	c.mu.Lock()
 	c.zen, c.goModels, c.nativeProtocols, c.unsupported, c.updatedAt = zen, goModels, native, unsupported, updatedAt
+	c.modelMeta = meta
+	c.cacheSource, c.stale = cacheSource, stale
 	c.mu.Unlock()
+}
+
+// LoadCache installs a validated disk snapshot into a catalog. It deliberately
+// changes only discovered state; configured protocol overrides and routing
+// preferences stay owned by the current Config.
+func (c *modelCatalog) LoadCache(path string) error {
+	cache, err := loadModelCatalogCache(path)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.zen = toSet(cache.Zen)
+	c.goModels = toSet(cache.Go)
+	c.nativeProtocols = cloneTierProtocols(cache.NativeProtocols)
+	c.unsupported = cloneTierBools(cache.Unsupported)
+	c.modelMeta = cloneModelMeta(cache.Metadata)
+	c.updatedAt = cache.UpdatedAt.UTC()
+	c.cacheSource = "disk"
+	c.stale = true
+	if c.cachePath == "" {
+		c.cachePath = path
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+// SaveCache snapshots only public model capability data. Credentials and
+// proxy configuration are not part of modelCatalog and can never enter this
+// file.
+func (c *modelCatalog) SaveCache() error {
+	c.mu.RLock()
+	path := c.cachePath
+	cache := modelCatalogCache{
+		SchemaVersion:   modelCatalogCacheSchemaVersion,
+		UpdatedAt:       c.updatedAt.UTC(),
+		Zen:             sortedSetKeys(c.zen),
+		Go:              sortedSetKeys(c.goModels),
+		NativeProtocols: cloneTierProtocols(c.nativeProtocols),
+		Unsupported:     cloneTierBools(c.unsupported),
+		Metadata:        cloneModelMeta(c.modelMeta),
+	}
+	c.mu.RUnlock()
+	if path == "" {
+		return nil
+	}
+	return saveModelCatalogCache(path, cache)
 }
 
 func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (modelRoute, error) {
@@ -340,12 +433,13 @@ func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
 			exposed++
 		}
 	}
+	stale := c.stale
+	if !c.updatedAt.IsZero() && c.refreshAfter > 0 {
+		stale = stale || time.Since(c.updatedAt) > max(2*c.refreshAfter, time.Minute)
+	}
 	return modelCatalogSnapshot{
-		Zen:       len(c.zen),
-		Go:        len(c.goModels),
-		Total:     len(seen),
-		Exposed:   exposed,
-		UpdatedAt: c.updatedAt,
+		Zen: len(c.zen), Go: len(c.goModels), Total: len(seen), Exposed: exposed,
+		UpdatedAt: c.updatedAt, CacheSource: c.cacheSource, Stale: stale,
 	}
 }
 
@@ -353,6 +447,19 @@ func (c *modelCatalog) Supported(model string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.supportedLocked(model)
+}
+
+// MetadataForTier returns the rich per-model metadata (context window,
+// reasoning, tool call, modalities) captured from the opencode catalog for
+// the tier that will actually serve the request. Same-named models can carry
+// different limits per tier, so callers must pass route.Tier — never a
+// tier-blind lookup. Anonymous routes always resolve to TierZen, which keeps
+// the keyless path on Zen metadata. The zero value is returned for models
+// the catalog does not describe (or before the first capability refresh).
+func (c *modelCatalog) MetadataForTier(model string, tier Tier) ModelMetadata {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.modelMeta[tier][model]
 }
 
 func (c *modelCatalog) supportedLocked(model string) bool {
@@ -407,9 +514,200 @@ func cloneBools(source map[string]bool) map[string]bool {
 	return result
 }
 
+func cloneModelMeta(source map[Tier]map[string]ModelMetadata) map[Tier]map[string]ModelMetadata {
+	result := map[Tier]map[string]ModelMetadata{TierZen: {}, TierGo: {}}
+	for _, tier := range []Tier{TierZen, TierGo} {
+		for id, md := range source[tier] {
+			result[tier][id] = md
+		}
+	}
+	return result
+}
+
+func sortedSetKeys(source map[string]bool) []string {
+	result := make([]string, 0, len(source))
+	for model, available := range source {
+		if available {
+			result = append(result, model)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func cloneTierProtocols(source map[Tier]map[string]Protocol) map[Tier]map[string]Protocol {
+	result := map[Tier]map[string]Protocol{TierZen: {}, TierGo: {}}
+	for _, tier := range []Tier{TierZen, TierGo} {
+		if protocols, ok := source[tier]; ok {
+			result[tier] = cloneProtocols(protocols)
+		}
+	}
+	return result
+}
+
+func cloneTierBools(source map[Tier]map[string]bool) map[Tier]map[string]bool {
+	result := map[Tier]map[string]bool{TierZen: {}, TierGo: {}}
+	for _, tier := range []Tier{TierZen, TierGo} {
+		if models, ok := source[tier]; ok {
+			result[tier] = cloneBools(models)
+		}
+	}
+	return result
+}
+
+func modelCatalogCachePath(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	return configPath + ".models.catalog.json"
+}
+
+func loadModelCatalogCache(path string) (modelCatalogCache, error) {
+	if path == "" {
+		return modelCatalogCache{}, os.ErrNotExist
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return modelCatalogCache{}, err
+	}
+	defer file.Close()
+	var cache modelCatalogCache
+	decoder := json.NewDecoder(io.LimitReader(file, 32<<20))
+	if err := decoder.Decode(&cache); err != nil {
+		return modelCatalogCache{}, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return modelCatalogCache{}, errors.New("model catalog cache contains multiple JSON values")
+		}
+		return modelCatalogCache{}, err
+	}
+	if cache.SchemaVersion != modelCatalogCacheSchemaVersion {
+		return modelCatalogCache{}, fmt.Errorf("unsupported model catalog cache schema version %d", cache.SchemaVersion)
+	}
+	if cache.UpdatedAt.IsZero() {
+		return modelCatalogCache{}, errors.New("model catalog cache is missing updated_at")
+	}
+	cache.Zen = normalizeModelIDs(cache.Zen)
+	cache.Go = normalizeModelIDs(cache.Go)
+	if len(cache.Zen) == 0 && len(cache.Go) == 0 {
+		return modelCatalogCache{}, errors.New("model catalog cache is empty")
+	}
+	if err := validateCatalogCapabilities(cache.NativeProtocols, cache.Unsupported); err != nil {
+		return modelCatalogCache{}, err
+	}
+	cache.NativeProtocols = cloneTierProtocols(cache.NativeProtocols)
+	cache.Unsupported = cloneTierBools(cache.Unsupported)
+	cache.UpdatedAt = cache.UpdatedAt.UTC()
+	return cache, nil
+}
+
+func normalizeModelIDs(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func validateCatalogCapabilities(native map[Tier]map[string]Protocol, unsupported map[Tier]map[string]bool) error {
+	for tier, protocols := range native {
+		if tier != TierZen && tier != TierGo {
+			return fmt.Errorf("model catalog cache contains unknown tier %q", tier)
+		}
+		for model, protocol := range protocols {
+			if model == "" || !validProtocol(protocol) {
+				return fmt.Errorf("model catalog cache contains invalid protocol for %q", model)
+			}
+		}
+	}
+	for tier, models := range unsupported {
+		if tier != TierZen && tier != TierGo {
+			return fmt.Errorf("model catalog cache contains unknown tier %q", tier)
+		}
+		for model := range models {
+			if strings.TrimSpace(model) == "" {
+				return errors.New("model catalog cache contains an empty unsupported model")
+			}
+		}
+	}
+	return nil
+}
+
+func saveModelCatalogCache(path string, cache modelCatalogCache) error {
+	if path == "" {
+		return nil
+	}
+	modelCatalogCacheWriteMu.Lock()
+	defer modelCatalogCacheWriteMu.Unlock()
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".models-catalog-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err = temp.Chmod(0600); err == nil {
+		_, err = temp.Write(data)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+
+	if runtime.GOOS == "windows" {
+		backup := path + ".replace"
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		hadOld := false
+		if _, statErr := os.Stat(path); statErr == nil {
+			if err := os.Rename(path, backup); err != nil {
+				return err
+			}
+			hadOld = true
+		} else if !os.IsNotExist(statErr) {
+			return statErr
+		}
+		if err := os.Rename(tempPath, path); err != nil {
+			if hadOld {
+				_ = os.Rename(backup, path)
+			}
+			return err
+		}
+		if hadOld {
+			_ = os.Remove(backup)
+		}
+		return nil
+	}
+	return os.Rename(tempPath, path)
+}
+
 type protocolCapabilities struct {
 	Protocols   map[Tier]map[string]Protocol
 	Unsupported map[Tier]map[string]bool
+	Metadata    map[Tier]map[string]ModelMetadata
 }
 
 type capabilityProvider struct {
@@ -420,8 +718,57 @@ type capabilityProvider struct {
 }
 
 type capabilityModel struct {
-	ID       string                   `json:"id"`
-	Provider *capabilityModelProvider `json:"provider"`
+	ID               string                     `json:"id"`
+	Provider         *capabilityModelProvider   `json:"provider"`
+	Limit            *capabilityModelLimit      `json:"limit"`
+	Reasoning        bool                       `json:"reasoning"`
+	ToolCall         bool                       `json:"tool_call"`
+	StructuredOutput bool                       `json:"structured_output"`
+	Modalities       *capabilityModelModalities `json:"modalities"`
+}
+
+type capabilityModelModalities struct {
+	Input  []string `json:"input"`
+	Output []string `json:"output"`
+}
+
+type capabilityModelLimit struct {
+	Context int `json:"context"`
+	Input   int `json:"input"`
+	Output  int `json:"output"`
+}
+
+// ModelMetadata carries the per-model capability fields surfaced through
+// /v1/models so consumers (harnesses like Pi or jcode) get real context
+// windows and feature flags from the catalog instead of guessing. It is
+// purely additive: routing does not depend on any of these fields.
+type ModelMetadata struct {
+	ContextWindow    int      `json:"context_window,omitempty"`
+	MaxInput         int      `json:"max_input,omitempty"`
+	MaxOutput        int      `json:"max_output,omitempty"`
+	Reasoning        bool     `json:"reasoning,omitempty"`
+	ToolCall         bool     `json:"tool_call,omitempty"`
+	StructuredOutput bool     `json:"structured_output,omitempty"`
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
+}
+
+func (m *capabilityModel) metadata() ModelMetadata {
+	md := ModelMetadata{
+		Reasoning:        m.Reasoning,
+		ToolCall:         m.ToolCall,
+		StructuredOutput: m.StructuredOutput,
+	}
+	if m.Modalities != nil {
+		md.InputModalities = m.Modalities.Input
+		md.OutputModalities = m.Modalities.Output
+	}
+	if m.Limit != nil {
+		md.ContextWindow = m.Limit.Context
+		md.MaxInput = m.Limit.Input
+		md.MaxOutput = m.Limit.Output
+	}
+	return md
 }
 
 type capabilityModelProvider struct {
@@ -458,6 +805,7 @@ func fetchProtocolCapabilities(ctx context.Context, client *http.Client, endpoin
 	result := protocolCapabilities{
 		Protocols:   map[Tier]map[string]Protocol{TierZen: {}, TierGo: {}},
 		Unsupported: map[Tier]map[string]bool{TierZen: {}, TierGo: {}},
+		Metadata:    map[Tier]map[string]ModelMetadata{TierZen: {}, TierGo: {}},
 	}
 	for providerID, provider := range providers {
 		tier, ok := capabilityTier(providerID, provider.API)
@@ -477,6 +825,7 @@ func fetchProtocolCapabilities(ctx context.Context, client *http.Client, endpoin
 			} else {
 				result.Unsupported[tier][modelID] = true
 			}
+			result.Metadata[tier][modelID] = model.metadata()
 		}
 	}
 	// The machine catalog is the primary source. The upstream endpoint tables
