@@ -1,4 +1,5 @@
-package main
+// Package identity derives stable session identities and unique request IDs.
+package identity
 
 import (
 	"crypto/rand"
@@ -7,26 +8,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"runtime"
-	"strings"
+
+	"opencode2api/internal/jsonutil"
 )
 
-type requestIDs struct {
+type RequestIDs struct {
 	Session       string
 	Request       string
 	Project       string
 	ParentSession string
 }
 
-func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
-	signal := firstString(
+func DeriveRequestIDs(r *http.Request, body map[string]any) RequestIDs {
+	signal := jsonutil.FirstString(
 		r.Header.Get("x-opencode-session"),
 		r.Header.Get("x-session-affinity"),
 		r.Header.Get("X-Session-Id"),
 		r.Header.Get("x-session-id"),
 		r.Header.Get("conversation-id"),
-		stringAt(body, "conversation_id"),
-		stringAt(body, "metadata", "session_id"),
+		jsonutil.StringAt(body, "conversation_id"),
+		jsonutil.StringAt(body, "metadata", "session_id"),
 	)
 	if signal == "" {
 		// Using the first user turn keeps a multi-turn conversation stable as its
@@ -34,24 +35,24 @@ func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
 		signal = conversationSeed(body)
 	}
 	if signal == "" {
-		signal = stringAt(body, "previous_response_id")
+		signal = jsonutil.StringAt(body, "previous_response_id")
 	}
 	if signal == "" || signal == `{}` {
-		signal = randomID("fallback", 16)
+		signal = RandomID("fallback", 16)
 	}
-	session := stableID("ses", signal)
-	projectSignal := firstString(r.Header.Get("x-opencode-project"), stringAt(body, "metadata", "project_id"))
+	session := StableID("ses", signal)
+	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
 	if projectSignal == "" {
 		projectSignal = "opencode2api:default-project"
 	}
-	parentSession := firstString(
+	parentSession := jsonutil.FirstString(
 		r.Header.Get("x-parent-session-id"),
-		stringAt(body, "metadata", "parent_session_id"),
+		jsonutil.StringAt(body, "metadata", "parent_session_id"),
 	)
-	return requestIDs{
+	return RequestIDs{
 		Session:       session,
-		Request:       randomID("req", 16),
-		Project:       stableID("prj", projectSignal),
+		Request:       RandomID("req", 16),
+		Project:       StableID("prj", projectSignal),
 		ParentSession: parentSession,
 	}
 }
@@ -61,9 +62,9 @@ func conversationSeed(body map[string]any) string {
 		return input
 	}
 	for _, field := range []string{"messages", "input"} {
-		for _, raw := range sliceAt(body, field) {
+		for _, raw := range jsonutil.SliceAt(body, field) {
 			item, ok := raw.(map[string]any)
-			if !ok || stringAt(item, "role") != "user" {
+			if !ok || jsonutil.StringAt(item, "role") != "user" {
 				continue
 			}
 			encoded, _ := json.Marshal(item["content"])
@@ -75,28 +76,15 @@ func conversationSeed(body map[string]any) string {
 	return ""
 }
 
-func stableID(prefix, value string) string {
+func StableID(prefix, value string) string {
 	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
 
-func randomID(prefix string, size int) string {
+func RandomID(prefix string, size int) string {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
 		panic(fmt.Sprintf("crypto/rand failed: %v", err))
 	}
 	return prefix + "_" + hex.EncodeToString(buf)
-}
-
-func firstString(values ...string) string {
-	for _, value := range values {
-		if value = strings.TrimSpace(value); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func opencodeUserAgent() string {
-	return fmt.Sprintf("opencode/1.18.21 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
 }
