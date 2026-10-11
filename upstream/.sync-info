@@ -1,5 +1,5 @@
-commit=79a208a4679106c4643edb1efa1a5f79011e0a6e
-timestamp=2026-09-26T06:59:12Z
+commit=1e2702f6e0562c7656d5bcfb99ce4b47383077a5
+timestamp=2026-10-11T08:11:28Z
 upstream_url=https://github.com/jasonxu114514/opencode2api
 upstream_branch=main
-source_ref=v1.3.5
+source_ref=v1.3.7-1-g1e2702f
